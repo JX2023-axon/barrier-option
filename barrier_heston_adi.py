@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, diags, eye, kron
 from scipy.sparse.linalg import splu
+from scipy.stats import norm
 
 
 @dataclass
@@ -304,8 +305,10 @@ def price_european_down_and_out_call_heston_adi(
     v_diag = diags(v_grid, format="csr")
     kv_diag = diags(params.kappa * (params.theta - v_grid), format="csr")
 
-    A0 = params.rho * params.sigma * kron(
-        v_diag @ D_v_sparse, S_diag @ D_S_sparse, format="csr"
+    A0 = (
+        params.rho
+        * params.sigma
+        * kron(v_diag @ D_v_sparse, S_diag @ D_S_sparse, format="csr")
     )
     A1 = (
         0.5 * kron(v_diag, S2_diag @ D_SS_sparse, format="csr")
@@ -436,10 +439,26 @@ def run_experiment_grid(
                     "group": label,
                     "run": i,
                     "price": result["price"],
-                    "min_surface": float(np.nanmin(surface)) if isinstance(surface, np.ndarray) else np.nan,
-                    "max_surface": float(np.nanmax(surface)) if isinstance(surface, np.ndarray) else np.nan,
-                    "has_nan": bool(np.isnan(surface).any()) if isinstance(surface, np.ndarray) else True,
-                    "has_inf": bool(np.isinf(surface).any()) if isinstance(surface, np.ndarray) else True,
+                    "min_surface": (
+                        float(np.nanmin(surface))
+                        if isinstance(surface, np.ndarray)
+                        else np.nan
+                    ),
+                    "max_surface": (
+                        float(np.nanmax(surface))
+                        if isinstance(surface, np.ndarray)
+                        else np.nan
+                    ),
+                    "has_nan": (
+                        bool(np.isnan(surface).any())
+                        if isinstance(surface, np.ndarray)
+                        else True
+                    ),
+                    "has_inf": (
+                        bool(np.isinf(surface).any())
+                        if isinstance(surface, np.ndarray)
+                        else True
+                    ),
                     "elapsed_sec": elapsed,
                     **overrides,
                 }
@@ -474,11 +493,90 @@ def run_experiment_grid(
     return pd.DataFrame(rows)
 
 
+def european_call_bsm_price(S0, K, T, r, q, sigma):
+
+    d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    call_price = S0 * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return call_price
+
+
+def european_put_bsm_price(S0, K, T, r, q, sigma):
+
+    d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    put_price = K * np.exp(-r * T) * norm.cdf(-d2) - S0 * np.exp(-q * T) * norm.cdf(-d1)
+    return put_price
+
+
+def european_down_and_in_call_bsm_price(S0, K, B, T, r, q, sigma):
+    lambda_ = (r - q + 0.5 * sigma**2) / (sigma**2)
+    y = np.log(B**2 / (S0 * K)) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    x1 = np.log(S0 / B) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    y1 = np.log(B / S0) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    if B < K:
+        c_di = S0 * np.exp(-q * T) * (B / S0) ** (2 * lambda_) * norm.cdf(
+            y
+        ) - K * np.exp(-r * T) * (B / S0) ** (2 * lambda_ - 2) * norm.cdf(
+            y - sigma * np.sqrt(T)
+        )
+    else:
+        c_di = (
+            european_call_bsm_price(S0, K, T, r, q, sigma)
+            - S0
+            * (np.exp(-q * T) * norm.cdf(x1) - (B / S0) ** (2 * lambda_) * norm.cdf(y1))
+            + K
+            * np.exp(-r * T)
+            * (
+                norm.cdf(y - sigma * np.sqrt(T))
+                - (B / S0) ** (2 * lambda_ - 2) * norm.cdf(y1 - sigma * np.sqrt(T))
+            )
+        )
+    return c_di
+
+
+def european_down_and_out_call_bsm_price(S0, K, B, T, r, q, sigma):
+    c_di = european_down_and_in_call_bsm_price(S0, K, B, T, r, q, sigma)
+    c_european = european_call_bsm_price(S0, K, T, r, q, sigma)
+    c_do = c_european - c_di
+    return c_do
+
+
+def european_up_and_in_call_bsm_price(S0, K, B, T, r, q, sigma):
+    lambda_ = (r - q + 0.5 * sigma**2) / (sigma**2)
+    y = np.log(B**2 / (S0 * K)) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    x1 = np.log(S0 / B) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    y1 = np.log(B / S0) / (sigma * np.sqrt(T)) + lambda_ * sigma * np.sqrt(T)
+    if B > K:
+        c_ui = (
+            S0 * np.exp(-q * T) * norm.cdf(x1)
+            - K * np.exp(-r * T) * norm.cdf(x1 - sigma * np.sqrt(T))
+            - S0
+            * np.exp(-q * T)
+            * (B / S0) ** (2 * lambda_)
+            * ((norm.cdf(-y) - norm.cdf(-y1)))
+            + K
+            * np.exp(-r * T)
+            * (B / S0) ** (2 * lambda_ - 2)
+            * (norm.cdf(-y + sigma * np.sqrt(T)) - norm.cdf(-y1 + sigma * np.sqrt(T)))
+        )
+    else:
+        c_ui = european_call_bsm_price(S0, K, T, r, q, sigma)
+    return c_ui
+
+def european_up_and_out_call_bsm_price(S0, K, B, T, r, q, sigma):
+    c_ui = european_up_and_in_call_bsm_price(S0, K, B, T, r, q, sigma)
+    c_european = european_call_bsm_price(S0, K, T, r, q, sigma)
+    c_uo = c_european - c_ui
+    return c_uo
+
 if __name__ == "__main__":
     params = KnockOutCallParams()
     result = price_european_down_and_out_call_heston_adi(params)
-    v0_value = result['v0']
-    v0_float = float(v0_value) if isinstance(v0_value, (float, int, np.floating)) else np.nan
+    v0_value = result["v0"]
+    v0_float = (
+        float(v0_value) if isinstance(v0_value, (float, int, np.floating)) else np.nan
+    )
     print(
         f"option price at S0={params.S0}, volatility={np.sqrt(v0_float):.6f} "
         f"is: {result['price']:.12f}"

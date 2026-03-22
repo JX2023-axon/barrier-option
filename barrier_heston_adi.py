@@ -40,17 +40,35 @@ class KnockOutCallParams:
 
 
 def create_nonuniform_asset_grid(
-    S_min: float, S_max: float, Ns: int, K: float, c: float
+    S_min: float, S_max: float, Ns: int, K: float, c: float, B: float | None = None
 ) -> np.ndarray:
-    xi = np.linspace(-1.0, 1.0, Ns)
-    alpha = c
-    eta = np.sinh(alpha * xi) / np.sinh(alpha)
-    S_grid = np.where(
-        eta <= 0.0,
-        K + (K - S_min) * eta,
-        K + (S_max - K) * eta,
-    )
-    return np.sort(S_grid)
+    """
+    Literature-standard sinh asset grid
+
+    s_i = K + c * sinh(xi_i),
+
+    where xi_i is uniformly spaced between the transformed lower/upper bounds.
+    The optional barrier lets the PDE domain start at the knock-out boundary instead
+    of at S_min, which avoids wasting points below the barrier.
+    """
+    if Ns < 2:
+        raise ValueError("Ns must be at least 2.")
+    if c <= 0.0:
+        raise ValueError("Asset grid scale c must be strictly positive.")
+
+    lower = S_min if B is None else max(S_min, B)
+    if lower >= S_max:
+        raise ValueError("Asset grid lower bound must be smaller than S_max.")
+
+    xi_min = np.arcsinh((lower - K) / c)
+    xi_max = np.arcsinh((S_max - K) / c)
+    xi = np.linspace(xi_min, xi_max, Ns)
+    S_grid = K + c * np.sinh(xi)
+
+    # Pin the endpoints exactly to the intended domain to avoid tiny roundoff drift.
+    S_grid[0] = lower
+    S_grid[-1] = S_max
+    return S_grid
 
 
 def create_nonuniform_variance_grid(
@@ -94,6 +112,29 @@ def second_derivative_matrix(x: np.ndarray) -> np.ndarray:
     return D2
 
 
+def _zero_sparse_rows(matrix: csr_matrix, rows: np.ndarray) -> csr_matrix:
+    if rows.size == 0:
+        return matrix
+
+    row_mask = np.ones(matrix.shape[0], dtype=bool)
+    row_mask[rows] = False
+    return matrix.multiply(row_mask[:, None]).tocsr()
+
+
+def _boundary_row_indices(Ns: int, Nv: int) -> np.ndarray:
+    rows = set()
+
+    # Asset boundaries for every variance level in Fortran-order vectorization.
+    for j in range(Nv):
+        rows.add(j * Ns)
+        rows.add(j * Ns + Ns - 1)
+
+    # The v=0 line is treated by a dedicated reduced-PDE solve.
+    rows.update(range(Ns))
+
+    return np.array(sorted(rows), dtype=int)
+
+
 def apply_boundary_conditions_matrix(
     U_mat: np.ndarray,
     S_grid: np.ndarray,
@@ -107,7 +148,7 @@ def apply_boundary_conditions_matrix(
     S_max = S_grid[-1]
 
     U_mat[S_grid <= B, :] = rebate
-    U_mat[0, :] = 0.0
+    U_mat[0, :] = rebate
     U_mat[-1, :] = S_max - K * np.exp(-r * tau)
     U_mat[:, -1] = U_mat[:, -2]
     U_mat[S_grid <= B, :] = rebate
@@ -130,7 +171,8 @@ def build_v0_line_solver(
     I_S_sparse = eye(Ns, format="csc")
     S_diag = diags(S_grid, format="csr")
     D_S_sparse = csr_matrix(D_S)
-    L_v0 = (r * (S_diag @ D_S_sparse) - (alpha_v0 + r) * I_S_sparse).tocsc()
+    L_v0 = r * (S_diag @ D_S_sparse) - (alpha_v0 + r) * I_S_sparse
+    L_v0 = _zero_sparse_rows(L_v0.tocsr(), np.array([0, Ns - 1], dtype=int)).tocsc()
     M_v0 = (I_S_sparse - dt * L_v0).tocsc()
     return alpha_v0, splu(M_v0)
 
@@ -155,7 +197,7 @@ def enforce_v0_boundary_european_line_solve(
     U_mat[:, 0] = U0_new
 
     U_mat[S_grid <= B, 0] = rebate
-    U_mat[0, 0] = 0.0
+    U_mat[0, 0] = rebate
     U_mat[-1, 0] = S_grid[-1] - K * np.exp(-r * tau)
     return U_mat
 
@@ -278,7 +320,7 @@ def price_european_down_and_out_call_heston_adi(
     params: KnockOutCallParams,
 ) -> dict[str, float | np.ndarray | dict[str, float | int] | None]:
     S_grid = create_nonuniform_asset_grid(
-        params.S_min, params.S_max, params.Ns, params.K, params.c
+        params.S_min, params.S_max, params.Ns, params.K, params.c, B=params.B
     )
     v_grid = create_nonuniform_variance_grid(
         params.v_min, params.v_max, params.Nv, params.d
@@ -320,6 +362,10 @@ def price_european_down_and_out_call_heston_adi(
         + kron(kv_diag @ D_v_sparse, I_S, format="csr")
         - 0.5 * params.r * eye(params.Ns * params.Nv, format="csr")
     )
+    boundary_rows = _boundary_row_indices(params.Ns, params.Nv)
+    A0 = _zero_sparse_rows(A0, boundary_rows)
+    A1 = _zero_sparse_rows(A1, boundary_rows)
+    A2 = _zero_sparse_rows(A2, boundary_rows)
     A = A0 + A1 + A2
 
     dt = params.T / params.Nt
@@ -428,6 +474,8 @@ def run_experiment_grid(
         started_at = perf_counter()
         params_dict = base_params.copy()
         params_dict.update(overrides)
+        if "B" in params_dict and "S_min" in params_dict:
+            params_dict["S_min"] = max(params_dict["S_min"], params_dict["B"])
         params = KnockOutCallParams(**params_dict)
 
         try:

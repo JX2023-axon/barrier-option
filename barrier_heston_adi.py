@@ -31,7 +31,8 @@ class KnockOutCallParams:
     Nt: int = 100
     c: float = 20.0
     d: float = 0.05
-    theta_ADI: float = 0.5
+    theta_ADI: float = 1.0 / 3.0
+    adi_scheme: str = "MCS"
     use_rannacher: bool = True
     v0: float | None = None
     debug: bool = False
@@ -216,6 +217,37 @@ def backward_euler_step(u_n: np.ndarray, lu_be) -> np.ndarray:
     return lu_be.solve(u_n)
 
 
+def mcs_adi_step(
+    u_n: np.ndarray,
+    dt: float,
+    theta_adi: float,
+    A,
+    A0,
+    A1,
+    A2,
+    lu_M1,
+    lu_M2,
+) -> np.ndarray:
+    Y0 = u_n + dt * (A @ u_n)
+
+    rhs1 = Y0 - theta_adi * dt * (A1 @ u_n)
+    Y1 = lu_M1.solve(rhs1)
+
+    rhs2 = Y1 - theta_adi * dt * (A2 @ u_n)
+    Y2 = lu_M2.solve(rhs2)
+
+    Y0_hat = Y0 + theta_adi * dt * (A0 @ (Y2 - u_n))
+    Y0_tilde = Y0_hat + (0.5 - theta_adi) * dt * (A @ (Y2 - u_n))
+
+    rhs1_tilde = Y0_tilde - theta_adi * dt * (A1 @ u_n)
+    Y1_tilde = lu_M1.solve(rhs1_tilde)
+
+    rhs2_tilde = Y1_tilde - theta_adi * dt * (A2 @ u_n)
+    Y2_tilde = lu_M2.solve(rhs2_tilde)
+
+    return Y2_tilde
+
+
 def bilinear_interpolate(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -376,6 +408,9 @@ def price_european_down_and_out_call_heston_adi(
     dt = params.T / params.Nt
     I = eye(params.Ns * params.Nv, format="csr")
     theta_adi = params.theta_ADI
+    adi_scheme = params.adi_scheme.strip().upper()
+    if adi_scheme not in {"DOUGLAS", "MCS"}:
+        raise ValueError(f"Unsupported ADI scheme: {params.adi_scheme}")
 
     M1 = (I - theta_adi * dt * A1).tocsc()
     M2 = (I - theta_adi * dt * A2).tocsc()
@@ -464,7 +499,10 @@ def price_european_down_and_out_call_heston_adi(
     adi_start = 1 if use_rannacher else 0
     for n in range(adi_start, params.Nt):
         tau -= dt
-        u = douglas_adi_step(u, dt, theta_adi, A, A1, A2, lu_M1, lu_M2)
+        if adi_scheme == "DOUGLAS":
+            u = douglas_adi_step(u, dt, theta_adi, A, A1, A2, lu_M1, lu_M2)
+        else:
+            u = mcs_adi_step(u, dt, theta_adi, A, A0, A1, A2, lu_M1, lu_M2)
         U_work = u.reshape((params.Ns, params.Nv), order="F")
         U_work = apply_boundary_conditions_matrix(
             U_work,

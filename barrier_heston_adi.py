@@ -32,6 +32,7 @@ class KnockOutCallParams:
     c: float = 20.0
     d: float = 0.05
     theta_ADI: float = 0.5
+    use_rannacher: bool = True
     v0: float | None = None
     debug: bool = False
 
@@ -211,6 +212,10 @@ def douglas_adi_step(u_n, dt, theta_adi, A, A1, A2, lu_M1, lu_M2):
     return Y2
 
 
+def backward_euler_step(u_n: np.ndarray, lu_be) -> np.ndarray:
+    return lu_be.solve(u_n)
+
+
 def bilinear_interpolate(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -377,6 +382,15 @@ def price_european_down_and_out_call_heston_adi(
     lu_M1 = splu(M1)
     lu_M2 = splu(M2)
 
+    use_rannacher = params.use_rannacher and params.Nt >= 2
+    if use_rannacher:
+        dt_rannacher = 0.5 * dt
+        M_be = (I - dt_rannacher * A).tocsc()
+        lu_be = splu(M_be)
+    else:
+        dt_rannacher = None
+        lu_be = None
+
     alpha_v0, lu_v0 = build_v0_line_solver(
         params.Ns,
         S_grid,
@@ -387,13 +401,69 @@ def price_european_down_and_out_call_heston_adi(
         params.theta,
         v_grid,
     )
+    if use_rannacher and dt_rannacher is not None:
+        alpha_v0_rannacher, lu_v0_rannacher = build_v0_line_solver(
+            params.Ns,
+            S_grid,
+            D_S,
+            dt_rannacher,
+            params.r,
+            params.kappa,
+            params.theta,
+            v_grid,
+        )
+    else:
+        alpha_v0_rannacher = None
+        lu_v0_rannacher = None
 
     U_work = U.copy()
     u = U_work.flatten(order="F")
     U_penultimate = None
 
-    for n in range(params.Nt):
-        tau_np1 = params.T - (n + 1) * dt
+    tau = params.T
+    debug_step = 0
+
+    if use_rannacher and lu_be is not None and dt_rannacher is not None:
+        for _ in range(2):
+            tau -= dt_rannacher
+            u = backward_euler_step(u, lu_be)
+            U_work = u.reshape((params.Ns, params.Nv), order="F")
+            U_work = apply_boundary_conditions_matrix(
+                U_work,
+                S_grid,
+                v_grid,
+                params.K,
+                params.B,
+                params.r,
+                tau,
+                params.R,
+            )
+            U_work = enforce_v0_boundary_european_line_solve(
+                U_work,
+                S_grid,
+                params.K,
+                params.B,
+                params.r,
+                tau,
+                params.R,
+                alpha_v0_rannacher,
+                lu_v0_rannacher,
+                dt_rannacher,
+            )
+            if params.debug:
+                print(
+                    f"R{debug_step}",
+                    np.nanmin(U_work),
+                    np.nanmax(U_work),
+                    np.any(np.isnan(U_work)),
+                    np.any(np.isinf(U_work)),
+                )
+            u = U_work.flatten(order="F")
+            debug_step += 1
+
+    adi_start = 1 if use_rannacher else 0
+    for n in range(adi_start, params.Nt):
+        tau -= dt
         u = douglas_adi_step(u, dt, theta_adi, A, A1, A2, lu_M1, lu_M2)
         U_work = u.reshape((params.Ns, params.Nv), order="F")
         U_work = apply_boundary_conditions_matrix(
@@ -403,7 +473,7 @@ def price_european_down_and_out_call_heston_adi(
             params.K,
             params.B,
             params.r,
-            tau_np1,
+            tau,
             params.R,
         )
         U_work = enforce_v0_boundary_european_line_solve(
@@ -412,7 +482,7 @@ def price_european_down_and_out_call_heston_adi(
             params.K,
             params.B,
             params.r,
-            tau_np1,
+            tau,
             params.R,
             alpha_v0,
             lu_v0,
